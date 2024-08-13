@@ -380,7 +380,8 @@ class JoystickWatcher:
     def _is_joystick(device):
         """Return True if a udev device represents a joystick.
         """
-        return bool(device.get('ID_INPUT_JOYSTICK') and device.device_node)
+        jsproperty = device.get('ID_INPUT_JOYSTICK')
+        return bool(jsproperty and jsproperty != '0' and device.device_node)
 
     @staticmethod
     def _get_device_description(device):
