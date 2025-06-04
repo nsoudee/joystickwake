@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A joystick-aware screen waker.
+A joystick/MIDI-aware screen waker.
 
 """
 
@@ -40,7 +40,7 @@ except ImportError:
 
 
 PROGRAM_NAME = os.path.basename(sys.argv[0])
-WAKE_REASON = "Active joystick"
+WAKE_REASON = "Active joystick/MIDI"
 
 
 #pylint:disable=consider-using-f-string  # python 3.5 lacks f-strings
@@ -314,8 +314,8 @@ class IdleInhibitor(Waker):
 # ======================================================================
 
 
-class JoystickWatcher:
-    """A joystick activity monitor.
+class DeviceWatcher:
+    """A joystick/MIDI activity monitor.
     """
     #pylint:disable=too-few-public-methods
     #pylint:disable=too-many-instance-attributes
@@ -323,7 +323,7 @@ class JoystickWatcher:
     def __init__(self, wakers=(), cooldown=10, useevdev=False):
         """Initialize internal data.
 
-        :param wakers:      An iterable of Waker instances to call when joystick
+        :param wakers:      An iterable of Waker instances to call when device
                             activity is detected.
         :param cooldown:    Minimum number of seconds between calling wakers.
         :param useevdev:    True to prefer /dev/input/event* over /dev/input/js*
@@ -341,23 +341,38 @@ class JoystickWatcher:
         self._best_devname_prefix = 'event' if useevdev else 'js'
         self._log = logging.getLogger('watcher')
 
-        # The evdev & joydev nodes for the same joystick will share a parent,
-        # so mapping devices by their parent lets us avoid watching both.
-        self._devinfo_by_parent = {}  # device parent -> (name, file descriptor)
+        self._devinfo = {}  # device -> (name, file descriptor)
         self._context = pyudev.Context()
-        self._monitor = pyudev.Monitor.from_netlink(self._context)
-        self._monitor.filter_by(subsystem='input')
+        self._subsystem_watchers = {
+            'input': self._watch_known_joysticks,
+            'sound': self._watch_known_midi,
+        }
+        self._subsystems = list(self._subsystem_watchers.keys())
+        self._monitors = {}
+        for subsystem in self._subsystems:
+            s = pyudev.Monitor.from_netlink(self._context)
+            s.filter_by(subsystem=subsystem)
+            self._monitors[subsystem] = s
 
     async def start(self):
-        """Find existing joysticks and add device monitors to the event loop.
+        """Find existing devices and add device monitors to the event loop.
         """
         if not self._wakers:
             self._log.error("exiting because no wakers are configured")
             sys.exit(1)
-        self._watch_known_joysticks()
-        self._monitor.start()
-        asyncio.get_event_loop().add_reader(
-            self._monitor.fileno(), self._poll_udev)
+        for subsystem in self._subsystems:
+            self._subsystem_watchers[subsystem]()
+            s = self._monitors[subsystem]
+            s.start()
+            asyncio.get_event_loop().add_reader(
+                s.fileno(), self._poll_udev, s)
+
+    def _watch_known_midi(self):
+        """Start watching known MIDI devices for activity.
+        """
+        for device in self._context.list_devices(subsystem='sound'):
+            if DeviceWatcher._is_midi(device):
+                self._watch_device(device)
 
     def _watch_known_joysticks(self):
         """Start watching known joystick devices for activity.
@@ -366,25 +381,44 @@ class JoystickWatcher:
             ID_INPUT_JOYSTICK=True):
             self._watch_device(device)
 
-    def _poll_udev(self):
+    def _poll_udev(self, monitor):
         """Poll udev for an event, and handle it.
         This is called when the udev monitor's file descriptor becomes readable.
         """
-        device = self._monitor.poll()
+        device = monitor.poll()
         if device.action == 'add':
             self._watch_device(device)
         elif device.action == 'remove':
             self._forget_device(device)
 
     @staticmethod
-    def _is_joystick(device):
+    def _is_joystick(device, best_devname_prefix):
         """Return True if a udev device represents a joystick.
         """
         jsproperty = device.get('ID_INPUT_JOYSTICK')
-        return bool(jsproperty and jsproperty != '0' and device.device_node)
+        n = device.device_node
+        return bool(
+                jsproperty and
+                jsproperty != '0' and
+                n and
+                n.startswith('/dev/input/' + best_devname_prefix)
+        )
 
     @staticmethod
-    def _get_device_description(device):
+    def _is_midi(device):
+        """Return True if a udev device represents something MIDI
+        """
+        n = device.device_node
+        return bool(n and n.startswith('/dev/midi'))
+
+    def _is_interesting_device(self, device):
+        return bool(
+                self._is_joystick(device, self._best_devname_prefix) or
+                self._is_midi(device)
+        )
+
+    @staticmethod
+    def _get_device_description(device, _log):
         """Return a human-readable description of a udev device.
         """
         props = device.properties
@@ -392,6 +426,9 @@ class JoystickWatcher:
             desc = '{} {}'.format(props['ID_VENDOR'], props['ID_MODEL'])
         except KeyError:
             desc = device.get('NAME') or device.parent.get('NAME') or '""'
+
+        if desc == '""' and device.parent is not None:
+            return DeviceWatcher._get_device_description(device.parent, _log)
 
         # Extra info, in case of multiple devices or missing vendor/description
         extra = []
@@ -443,14 +480,20 @@ class JoystickWatcher:
             pass
         return '\n'.join(lines)
 
+    def _print_devinfo(self):
+        e = self._log.debug
+        e('Current devinfo:')
+        for d in self._devinfo:
+            e(" * %s: %s" % (d, self._devinfo[d]))
+
     def _watch_device(self, device):
-        """Start watching a udev device for activity, if it is a joystick.
+        """Start watching a udev device for activity, if it is interesting.
         """
-        if not self._is_joystick(device):
+        if not self._is_interesting_device(device):
             return
 
         # If the device is no more useful than one we already watch, skip it.
-        olddevinfo = self._devinfo_by_parent.get(device.parent)
+        olddevinfo = self._devinfo.get(device)
         if olddevinfo:
             if (olddevinfo.name.startswith(self._best_devname_prefix)
                 or not device.sys_name.startswith(self._best_devname_prefix)):
@@ -481,22 +524,19 @@ class JoystickWatcher:
 
         asyncio.get_event_loop().add_reader(
             newdevinfo.fd, self._read_fd, newdevinfo)
-        self._devinfo_by_parent[device.parent] = newdevinfo
+        self._devinfo[device] = newdevinfo
 
-        self._log.info("%s is a joystick: %s",
-            device.sys_name, self._get_device_description(device))
+        self._log.info("%s is an interesting device: %s",
+            device.sys_name, self._get_device_description(device, self._log))
+        self._print_devinfo()
 
     def _forget_device(self, device):
         """Stop watching a udev device for activity.
         """
-        devinfo = self._devinfo_by_parent.get(device.parent)
+        devinfo = self._devinfo.get(device)
         if not devinfo:
             return
-        if devinfo.name != device.sys_name:
-            # We're watching a sibling device file; no need to forget this one.
-            return
-
-        del self._devinfo_by_parent[device.parent]
+        del self._devinfo[device]
         asyncio.get_event_loop().remove_reader(devinfo.fd)
         try:
             os.close(devinfo.fd)
@@ -505,6 +545,7 @@ class JoystickWatcher:
                 raise
 
         self._log.info("%s removed from the system", device.sys_name)
+        self._print_devinfo()
 
     def _read_fd(self, devinfo):
         """Read data from a device.
@@ -546,16 +587,16 @@ DEFAULT_WAKERS = [
     ExecWaker('xset', 'dpms', 'force', 'on', regex=".+", name="X11 DPMS"),
     ExecWaker('xset', 's', 'reset', regex=".+", name="X11"),
     ExecWaker('xscreensaver-command', '-deactivate', name="XScreenSaver"),
-    ExecWaker('gnome-screensaver-command', '--deactivate',
-        name="GNOME Screensaver"),
-    ExecWaker('mate-screensaver-command', '--poke', name="MATE"),
-    ExecWaker('xfce4-screensaver-command', '--poke', name="Xfce"),
-    DBusWaker('org.freedesktop.ScreenSaver.SimulateUserActivity',
-        desktop='KDE', name="KDE"),
-    DBusWaker('org.freedesktop.ScreenSaver.Inhibit', PROGRAM_NAME, WAKE_REASON,
-        desktop='GNOME', name="heartbeat Inhibit"),
-    DBusWaker('org.gnome.ScreenSaver.SetActive', False,
-        desktop='GNOME', name="GNOME SetActive"),
+    #ExecWaker('gnome-screensaver-command', '--deactivate',
+    #    name="GNOME Screensaver"),
+    #ExecWaker('mate-screensaver-command', '--poke', name="MATE"),
+    #ExecWaker('xfce4-screensaver-command', '--poke', name="Xfce"),
+    #DBusWaker('org.freedesktop.ScreenSaver.SimulateUserActivity',
+    #    desktop='KDE', name="KDE"),
+    #DBusWaker('org.freedesktop.ScreenSaver.Inhibit', PROGRAM_NAME, WAKE_REASON,
+    #    desktop='GNOME', name="heartbeat Inhibit"),
+    #DBusWaker('org.gnome.ScreenSaver.SetActive', False,
+    #    desktop='GNOME', name="GNOME SetActive"),
     ]
 
 
@@ -574,7 +615,7 @@ def parse_command_line(config):
     """Apply command line options to the global configuration.
     """
     parser = argparse.ArgumentParser(
-        description="Wakes the screen when joysticks are active.")
+        description="Wakes the screen when joystick/MIDI devices are active.")
     parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('--loglevel',
         choices='debug info warning error critical'.split())
@@ -701,7 +742,7 @@ def main():
         wakers.append(IdleInhibitor(cooldown=config.cooldown))
 
     try:
-        watcher = JoystickWatcher(wakers=wakers, cooldown=config.cooldown)
+        watcher = DeviceWatcher(wakers=wakers, cooldown=config.cooldown)
         loop.run_until_complete(watcher.start())
         loop.run_forever()
 
