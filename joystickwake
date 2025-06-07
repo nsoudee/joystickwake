@@ -25,6 +25,7 @@ import re
 import signal
 import sys
 import time
+import alsa_midi
 
 try:
     import dbus_next
@@ -343,6 +344,15 @@ class DeviceWatcher:
 
         self._devinfo = {}  # device -> (name, file descriptor)
         self._context = pyudev.Context()
+        self._seq_client = alsa_midi.AsyncSequencerClient('MIDIWaker')
+        self._midi_port = self._seq_client.create_port(
+                "output", alsa_midi.WRITE_PORT)
+        self._midi_ports = []
+        self._midi_watchers = []
+        self._udev_pollers = {
+            'input': self._poll_udev_input,
+            'sound': self._poll_udev_midi,
+        }
         self._subsystem_watchers = {
             'input': self._watch_known_joysticks,
             'sound': self._watch_known_midi,
@@ -353,6 +363,25 @@ class DeviceWatcher:
             s = pyudev.Monitor.from_netlink(self._context)
             s.filter_by(subsystem=subsystem)
             self._monitors[subsystem] = s
+
+    def _interesting_midi_event(self, event):
+        return True
+
+    async def start_midi(self):
+        while True:
+            event = await self._seq_client.event_input()
+            if self._interesting_midi_event(event):
+                self._log.debug("MIDI activity: %s", repr(event))
+                self._wake_screen()
+
+    def _port_match(self, p1, p2):
+        return (p1.client_id == p2.client_id and p1.port_id == p2.port_id)
+
+    def _match_watcher(self, port):
+        for w in self._midi_watchers:
+            if self._port_match(port, w):
+                return True
+        return False
 
     async def start(self):
         """Find existing devices and add device monitors to the event loop.
@@ -365,31 +394,64 @@ class DeviceWatcher:
             s = self._monitors[subsystem]
             s.start()
             asyncio.get_event_loop().add_reader(
-                s.fileno(), self._poll_udev, s)
+                s.fileno(), self._udev_pollers[subsystem], s)
+
+    def _forget_all_midi_devices(self):
+        self._midi_watchers = []
+
+    def _match_existing_port(self, port, ports):
+        for p in ports:
+            if p.client_id == port.client_id and p.port_id == port.port_id:
+                return True
+        return False
+
+    def _forget_missing_midi_ports(self, ports):
+        new_midi_watchers = []
+        dirty = False
+        for p in self._midi_watchers:
+            if self._match_existing_port(p, ports):
+                new_midi_watchers.append(p)
+            else:
+                dirty = True
+        self._midi_watchers = new_midi_watchers
+        return dirty
+
+    def _print_watched_ports(self):
+        self._log.debug('Currently watched ports:')
+        for p in self._midi_watchers:
+            self._log.debug(repr(p))
 
     def _watch_known_midi(self):
         """Start watching known MIDI devices for activity.
         """
-        for device in self._context.list_devices(subsystem='sound'):
-            if DeviceWatcher._is_midi(device):
-                self._watch_device(device)
+        ports = self._seq_client.list_ports(input=True)
+        dirty = self._forget_missing_midi_ports(ports)
+        for port in ports:
+            dirty = self._watch_midi_port(port) or dirty
+        if dirty:
+            self._print_watched_ports()
 
     def _watch_known_joysticks(self):
         """Start watching known joystick devices for activity.
         """
         for device in self._context.list_devices(subsystem='input',
             ID_INPUT_JOYSTICK=True):
-            self._watch_device(device)
+            self._watch_input_device(device)
 
-    def _poll_udev(self, monitor):
+    def _poll_udev_input(self, monitor):
         """Poll udev for an event, and handle it.
         This is called when the udev monitor's file descriptor becomes readable.
         """
         device = monitor.poll()
         if device.action == 'add':
-            self._watch_device(device)
+            self._watch_input_device(device)
         elif device.action == 'remove':
-            self._forget_device(device)
+            self._forget_input_device(device)
+
+    def _poll_udev_midi(self, monitor):
+        device = monitor.poll()
+        if device.action in ('add', 'remove'):
+            self._watch_known_midi()
 
     @staticmethod
     def _is_joystick(device, best_devname_prefix):
@@ -425,7 +487,8 @@ class DeviceWatcher:
         try:
             desc = '{} {}'.format(props['ID_VENDOR'], props['ID_MODEL'])
         except KeyError:
-            desc = device.get('NAME') or device.parent.get('NAME') or '""'
+            desc = device.get('NAME') or \
+                    (device.parent and device.parent.get('NAME')) or '""'
 
         if desc == '""' and device.parent is not None:
             return DeviceWatcher._get_device_description(device.parent, _log)
@@ -486,7 +549,23 @@ class DeviceWatcher:
         for d in self._devinfo:
             e(" * %s: %s" % (d, self._devinfo[d]))
 
-    def _watch_device(self, device):
+    def _watch_midi_port(self, port):
+        # Add MIDI device to list of things to watch if not in there yet
+        dirty = False
+        if self._match_watcher(port):
+            #self._log.debug('Port match: %s' % (repr(port),))
+            return dirty
+        try:
+            self._midi_port.connect_to(port)
+        except alsa_midi.exceptions.ALSAError:
+            return dirty
+        #self._log.debug('Adding port watcher: %s' % (repr(port),))
+        self._midi_watchers.append(port)
+        dirty = True
+        return dirty
+
+
+    def _watch_input_device(self, device):
         """Start watching a udev device for activity, if it is interesting.
         """
         if not self._is_interesting_device(device):
@@ -530,7 +609,7 @@ class DeviceWatcher:
             device.sys_name, self._get_device_description(device, self._log))
         self._print_devinfo()
 
-    def _forget_device(self, device):
+    def _forget_input_device(self, device):
         """Stop watching a udev device for activity.
         """
         devinfo = self._devinfo.get(device)
@@ -743,7 +822,9 @@ def main():
 
     try:
         watcher = DeviceWatcher(wakers=wakers, cooldown=config.cooldown)
-        loop.run_until_complete(watcher.start())
+        all_groups = asyncio.gather(
+                watcher.start(), watcher.start_midi())
+        loop.run_until_complete(all_groups)
         loop.run_forever()
 
     except KeyboardInterrupt:

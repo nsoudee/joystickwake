@@ -39,7 +39,10 @@ setup(
     url='https://github.com/foresto/joystickwake',
     python_requires='>=3.5',
     requires=['pyudev'],
-    install_requires=['pyudev'],  # for pip
+    install_requires=[
+        'pyudev',       # for pip
+        'alsa-midi',    # for MIDI
+    ],
     scripts=['joystickwake'],
     data_files=[('/etc/xdg/autostart', ['joystickwake.desktop'])],
     platforms=['Linux'],
