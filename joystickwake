@@ -396,14 +396,17 @@ class DeviceWatcher:
             asyncio.get_event_loop().add_reader(
                 s.fileno(), self._udev_pollers[subsystem], s)
 
-    def _forget_all_midi_devices(self):
-        self._midi_watchers = []
-
     def _match_existing_port(self, port, ports):
         for p in ports:
             if p.client_id == port.client_id and p.port_id == port.port_id:
                 return True
         return False
+
+    def _get_midi_port_description(self, port):
+        return port.name
+
+    def _get_midi_port_name(self, port):
+        return '%s:%s' % (port.client_id, port.port_id)
 
     def _forget_missing_midi_ports(self, ports):
         new_midi_watchers = []
@@ -412,6 +415,7 @@ class DeviceWatcher:
             if self._match_existing_port(p, ports):
                 new_midi_watchers.append(p)
             else:
+                self._removal_msg(self._get_midi_port_name(p))
                 dirty = True
         self._midi_watchers = new_midi_watchers
         return dirty
@@ -561,6 +565,10 @@ class DeviceWatcher:
             return dirty
         #self._log.debug('Adding port watcher: %s' % (repr(port),))
         self._midi_watchers.append(port)
+        self._log.info('%s is a MIDI controller: %s' % (
+                self._get_midi_port_name(port),
+                self._get_midi_port_description(port)))
+        self._log.debug(dir(port))
         dirty = True
         return dirty
 
@@ -605,9 +613,12 @@ class DeviceWatcher:
             newdevinfo.fd, self._read_fd, newdevinfo)
         self._devinfo[device] = newdevinfo
 
-        self._log.info("%s is an interesting device: %s",
+        self._log.info("%s is a joystick: %s",
             device.sys_name, self._get_device_description(device, self._log))
         self._print_devinfo()
+
+    def _removal_msg(self, name):
+        self._log.info("%s removed from the system", name)
 
     def _forget_input_device(self, device):
         """Stop watching a udev device for activity.
@@ -622,8 +633,7 @@ class DeviceWatcher:
         except OSError as error:
             if error.errno != errno.ENODEV:
                 raise
-
-        self._log.info("%s removed from the system", device.sys_name)
+        self._removal_msg(device.sys_name)
         self._print_devinfo()
 
     def _read_fd(self, devinfo):
