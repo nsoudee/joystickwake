@@ -313,19 +313,69 @@ class IdleInhibitor(Waker):
 
 # ======================================================================
 
+class SubsystemMonitor:
+    def __init__(self, context, subsystem, func_add, func_remove):
+        self._context = context
+        self._monitor = pyudev.Monitor.from_netlink(context)
+        self._monitor.filter_by(subsystem=subsystem)
+        self._add_device = func_add
+        self._remove_device = func_remove
+        self._log = logging.getLogger('watcher')
 
-class JoystickWatcher:
+    def start(self):
+        self._monitor.start()
+        asyncio.get_event_loop().add_reader(
+            self._monitor.fileno(), self._poll_udev)
+
+    def _poll_udev(self):
+        """Poll udev for an event, and handle it.
+        This is called when the udev monitor's file descriptor becomes readable.
+        """
+        device = self._monitor.poll()
+        if device.action == 'add':
+            self._add_device(device)
+        elif device.action == 'remove':
+            self._remove_device(device)
+
+
+class ScreenWaker:
+    def __init__(self, wakers=None, cooldown=10):
+        self._wakers = list(wakers)
+        self._waking = None # a Task reference to let wake routines complete
+        self._cooldown = cooldown
+        self._last_wake = 0  # time when we last woke the screen
+        self._log = logging.getLogger('watcher')
+
+    def _wake_screen(self):
+        """Wake the screen if we haven't done so recently.
+        """
+        now = time.monotonic()
+        if now - self._last_wake < self._cooldown:
+            return
+        self._last_wake = now
+
+        # Discard any wakers that failed last time.
+        self._wakers = [waker for waker in self._wakers if not waker.failed]
+        if not self._wakers:
+            self._log.error("exiting because all wakers have failed")
+            sys.exit(1)
+
+        self._log.info("waking the screen")
+        wakeroutines = [waker.wake() for waker in self._wakers]
+        self._waking = asyncio.ensure_future(asyncio.gather(*wakeroutines))
+
+class DeviceWatcher:
+    pass
+
+class JoystickWatcher(DeviceWatcher):
     """A joystick activity monitor.
     """
     #pylint:disable=too-few-public-methods
     #pylint:disable=too-many-instance-attributes
 
-    def __init__(self, wakers=(), cooldown=10, useevdev=False):
+    def __init__(self, waker, context, useevdev=False):
         """Initialize internal data.
 
-        :param wakers:      An iterable of Waker instances to call when joystick
-                            activity is detected.
-        :param cooldown:    Minimum number of seconds between calling wakers.
         :param useevdev:    True to prefer /dev/input/event* over /dev/input/js*
                             when a joystick has both.
                             (The latter is the older joystick device interface.
@@ -334,47 +384,28 @@ class JoystickWatcher:
 
         Monitoring will begin when start() is called and the event loop runs.
         """
-        self._wakers = list(wakers)
-        self._waking = None # a Task reference to let wake routines complete
-        self._cooldown = cooldown
-        self._last_wake = 0  # time when we last woke the screen
         self._best_devname_prefix = 'event' if useevdev else 'js'
         self._log = logging.getLogger('watcher')
+        self._waker = waker
+        self._monitor = SubsystemMonitor(
+                context, "input", self._watch_device, self._forget_device)
 
         # The evdev & joydev nodes for the same joystick will share a parent,
         # so mapping devices by their parent lets us avoid watching both.
         self._devinfo_by_parent = {}  # device parent -> (name, file descriptor)
-        self._context = pyudev.Context()
-        self._monitor = pyudev.Monitor.from_netlink(self._context)
-        self._monitor.filter_by(subsystem='input')
 
     async def start(self):
         """Find existing joysticks and add device monitors to the event loop.
         """
-        if not self._wakers:
-            self._log.error("exiting because no wakers are configured")
-            sys.exit(1)
         self._watch_known_joysticks()
         self._monitor.start()
-        asyncio.get_event_loop().add_reader(
-            self._monitor.fileno(), self._poll_udev)
 
     def _watch_known_joysticks(self):
         """Start watching known joystick devices for activity.
         """
-        for device in self._context.list_devices(subsystem='input',
+        for device in self._monitor._context.list_devices(subsystem='input',
             ID_INPUT_JOYSTICK=True):
             self._watch_device(device)
-
-    def _poll_udev(self):
-        """Poll udev for an event, and handle it.
-        This is called when the udev monitor's file descriptor becomes readable.
-        """
-        device = self._monitor.poll()
-        if device.action == 'add':
-            self._watch_device(device)
-        elif device.action == 'remove':
-            self._forget_device(device)
 
     @staticmethod
     def _is_joystick(device):
@@ -514,29 +545,11 @@ class JoystickWatcher:
         try:
             os.read(devinfo.fd, 960)
             self._log.debug("%s activity", devinfo.name)
-            self._wake_screen()
+            self._waker._wake_screen()
         except OSError as error:
             if error.errno != errno.ENODEV:
                 raise
             asyncio.get_event_loop().remove_reader(devinfo.fd)
-
-    def _wake_screen(self):
-        """Wake the screen if we haven't done so recently.
-        """
-        now = time.monotonic()
-        if now - self._last_wake < self._cooldown:
-            return
-        self._last_wake = now
-
-        # Discard any wakers that failed last time.
-        self._wakers = [waker for waker in self._wakers if not waker.failed]
-        if not self._wakers:
-            self._log.error("exiting because all wakers have failed")
-            sys.exit(1)
-
-        self._log.info("waking the screen")
-        wakeroutines = [waker.wake() for waker in self._wakers]
-        self._waking = asyncio.ensure_future(asyncio.gather(*wakeroutines))
 
 
 # ======================================================================
@@ -700,9 +713,11 @@ def main():
     if config.inhibit:
         wakers.append(IdleInhibitor(cooldown=config.cooldown))
 
+    context = pyudev.Context()
+    waker = ScreenWaker(wakers=wakers, cooldown=config.cooldown)
     try:
-        watcher = JoystickWatcher(wakers=wakers, cooldown=config.cooldown)
-        loop.run_until_complete(watcher.start())
+        joystick_watcher = JoystickWatcher(waker, context)
+        loop.run_until_complete(joystick_watcher.start())
         loop.run_forever()
 
     except KeyboardInterrupt:
