@@ -37,7 +37,11 @@ try:
     import Xlib.error
 except ImportError:
     pass
-
+try:
+    import alsa_midi
+    WATCH_MIDI = True
+except ImportError:
+    WATCH_MIDI = False
 
 PROGRAM_NAME = os.path.basename(sys.argv[0])
 WAKE_REASON = "Active joystick"
@@ -364,8 +368,11 @@ class ScreenWaker:
         wakeroutines = [waker.wake() for waker in self._wakers]
         self._waking = asyncio.ensure_future(asyncio.gather(*wakeroutines))
 
+
 class DeviceWatcher:
-    pass
+    def _removal_msg(self, name):
+        self._log.info("%s removed from the system", name)
+
 
 class JoystickWatcher(DeviceWatcher):
     """A joystick activity monitor.
@@ -535,7 +542,7 @@ class JoystickWatcher(DeviceWatcher):
             if error.errno != errno.ENODEV:
                 raise
 
-        self._log.info("%s removed from the system", device.sys_name)
+        self._removal_msg(device.sys_name)
 
     def _read_fd(self, devinfo):
         """Read data from a device.
@@ -550,6 +557,122 @@ class JoystickWatcher(DeviceWatcher):
             if error.errno != errno.ENODEV:
                 raise
             asyncio.get_event_loop().remove_reader(devinfo.fd)
+
+
+# ======================================================================
+
+class MidiWatcher(DeviceWatcher):
+    """A MIDI activity monitor.
+    """
+    #pylint:disable=too-few-public-methods
+    #pylint:disable=too-many-instance-attributes
+
+    def __init__(self, waker, context):
+        """Initialize internal data.
+
+        Monitoring will begin when start() is called and the event loop runs.
+        """
+        self._log = logging.getLogger('watcher')
+        self._waker = waker
+        self._monitor = SubsystemMonitor(
+                context, "sound", self._watch_device, self._forget_device)
+
+        self._seq_client = alsa_midi.AsyncSequencerClient('MIDIWaker')
+        self._midi_port = self._seq_client.create_port(
+                "output", alsa_midi.WRITE_PORT)
+        self._midi_watchers = []
+
+    def _interesting_midi_event(self, event):
+        return True
+
+    async def start(self):
+        self._log.debug("Monitoring sound devices for MIDI")
+        self._watch_known_midi()
+        self._monitor.start()
+        while True:
+            event = await self._seq_client.event_input()
+            if self._interesting_midi_event(event):
+                self._log.debug("MIDI activity: %s", repr(event))
+                self._waker._wake_screen()
+
+    def _port_match(self, p1, p2):
+        return (p1.client_id == p2.client_id and p1.port_id == p2.port_id)
+
+    def _match_watcher(self, port):
+        for w in self._midi_watchers:
+            if self._port_match(port, w):
+                return True
+        return False
+
+    def _match_existing_port(self, port, ports):
+        for p in ports:
+            if self._port_match(port, p):
+                return True
+        return False
+
+    def _get_midi_port_description(self, port):
+        return port.name
+
+    def _get_midi_port_name(self, port):
+        return '%s:%s' % (port.client_id, port.port_id)
+
+    def _forget_missing_midi_ports(self, ports):
+        new_midi_watchers = []
+        dirty = False
+        for p in self._midi_watchers:
+            if self._match_existing_port(p, ports):
+                new_midi_watchers.append(p)
+            else:
+                self._removal_msg(self._get_midi_port_name(p))
+                dirty = True
+        self._midi_watchers = new_midi_watchers
+        return dirty
+
+    def _print_watched_ports(self):
+        self._log.debug('Currently watched ports:')
+        for p in self._midi_watchers:
+            self._log.debug(repr(p))
+
+    def _watch_known_midi(self):
+        """Start watching known MIDI devices for activity.
+        """
+        ports = self._seq_client.list_ports(input=True)
+        dirty = self._forget_missing_midi_ports(ports)
+        for port in ports:
+            dirty = self._watch_midi_port(port) or dirty
+        if dirty:
+            self._print_watched_ports()
+
+    def _watch_device(self, device):
+        self._watch_known_midi()
+
+    def _forget_device(self, device):
+        self._watch_known_midi()
+
+    @staticmethod
+    def _is_midi(device):
+        """Return True if a udev device represents something MIDI
+        """
+        n = device.device_node
+        return bool(n and n.startswith('/dev/midi'))
+
+    def _watch_midi_port(self, port):
+        # Add MIDI device to list of things to watch if not in there yet
+        dirty = False
+        if self._match_watcher(port):
+            #self._log.debug('Port match: %s' % (repr(port),))
+            return dirty
+        try:
+            self._midi_port.connect_from(port)
+        except alsa_midi.exceptions.ALSAError:
+            return dirty
+        #self._log.debug('Adding port watcher: %s' % (repr(port),))
+        self._midi_watchers.append(port)
+        self._log.info('%s is a MIDI controller: %s' % (
+                self._get_midi_port_name(port),
+                self._get_midi_port_description(port)))
+        dirty = True
+        return dirty
 
 
 # ======================================================================
@@ -715,9 +838,12 @@ def main():
 
     context = pyudev.Context()
     waker = ScreenWaker(wakers=wakers, cooldown=config.cooldown)
+    watchers = []
+    watchers.append(JoystickWatcher(waker, context))
+    if WATCH_MIDI:
+        watchers.append(MidiWatcher(waker, context))
     try:
-        joystick_watcher = JoystickWatcher(waker, context)
-        loop.run_until_complete(joystick_watcher.start())
+        loop.run_until_complete(asyncio.gather(*[w.start() for w in watchers]))
         loop.run_forever()
 
     except KeyboardInterrupt:
