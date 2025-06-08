@@ -559,7 +559,7 @@ class DeviceWatcher:
             #self._log.debug('Port match: %s' % (repr(port),))
             return dirty
         try:
-            self._midi_port.connect_to(port)
+            self._midi_port.connect_from(port)
         except alsa_midi.exceptions.ALSAError:
             return dirty
         #self._log.debug('Adding port watcher: %s' % (repr(port),))
