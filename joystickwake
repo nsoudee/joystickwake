@@ -347,7 +347,6 @@ class DeviceWatcher:
         self._seq_client = alsa_midi.AsyncSequencerClient('MIDIWaker')
         self._midi_port = self._seq_client.create_port(
                 "output", alsa_midi.WRITE_PORT)
-        self._midi_ports = []
         self._midi_watchers = []
         self._udev_pollers = {
             'input': self._poll_udev_input,
@@ -568,7 +567,6 @@ class DeviceWatcher:
         self._log.info('%s is a MIDI controller: %s' % (
                 self._get_midi_port_name(port),
                 self._get_midi_port_description(port)))
-        self._log.debug(dir(port))
         dirty = True
         return dirty
 
